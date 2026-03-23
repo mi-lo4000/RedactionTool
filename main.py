@@ -21,8 +21,7 @@ import pymupdf as fitz  # PyPI package "fitz" is unrelated; use pymupdf explicit
 
 # ── Default configuration (edit for your layout) ─────────────────────────────
 
-DEFAULT_OUTPUT_SUBDIR = "dedacted"
-OUTPUT_NAME_SUFFIX = "_dedact"  # e.g. invoice.pdf → invoice_dedact.pdf
+DEFAULT_OUTPUT_SUBDIR = "Redacted"
 REDACT_COLOR = (0, 0, 0)
 
 # Inspect mode: max pages to print per PDF (None = all). Use 1 while tuning new columns.
@@ -324,6 +323,93 @@ def inspect_page(doc: fitz.Document, page_index: int = 0, log=print) -> None:
         log(f"  x0={w[0]:6.1f}  y0={w[1]:6.1f}  x1={w[2]:6.1f}  y1={w[3]:6.1f}  → '{w[4]}'")
 
 
+def build_redacted_doc_for_preview(
+    input_pdf: Path,
+    *,
+    columns: list | None = None,
+    redact_color: tuple = REDACT_COLOR,
+    log=print,
+) -> fitz.Document:
+    """
+    Build a redacted Document in memory for preview.
+    This does NOT save any output file.
+    """
+    cols = columns if columns is not None else COLUMNS_TO_REDACT
+    doc = fitz.open(input_pdf)
+    total_pages = len(doc)
+
+    for col in cols:
+        kind = _redact_rule_kind(col)
+        if kind == "invalid":
+            log(
+                f"  ✗ Rule '{col.get('name', '?')}' has both redact_text and text_zone — use only one."
+            )
+            continue
+        if kind is None:
+            log(
+                f"  ✗ Rule '{col.get('name', '?')}' needs text_zone{{find:...}} or redact_text: ..."
+            )
+            continue
+
+        target_pages = resolve_target_pages(col, total_pages)
+        for page_idx in target_pages:
+            if page_idx >= total_pages:
+                continue
+            page = doc[page_idx]
+            if kind == "redact_text":
+                apply_text_redacts(
+                    page,
+                    col,
+                    redact_color,
+                    page_idx=page_idx,
+                    total_pages=total_pages,
+                    log=log,
+                )
+            else:
+                apply_text_zone_redact(
+                    page,
+                    col,
+                    redact_color,
+                    page_idx=page_idx,
+                    total_pages=total_pages,
+                    log=log,
+                )
+
+    # Apply redactions so renders show the blacked-out regions.
+    for i in range(total_pages):
+        doc[i].apply_redactions()
+    return doc
+
+
+def render_page_for_preview(
+    doc: fitz.Document,
+    page_idx: int,
+    *,
+    max_width_px: int = 900,
+    zoom_factor: float = 2.0,
+) -> "tuple[Path, int]":
+    """
+    Render one page to a temporary PNG file for Tkinter display.
+    Returns (png_path, page_width_px_estimate).
+    """
+    import tempfile
+
+    page = doc[page_idx]
+    # Base scale tries to fit the page into `max_width_px`, then `zoom_factor`
+    # increases it (e.g. 200% => 2.0).
+    base_scale = max_width_px / max(1.0, page.rect.width)
+    scale = base_scale * float(zoom_factor)
+    scale = min(4.0, max(0.3, scale))
+    matrix = fitz.Matrix(scale, scale)
+    pix = page.get_pixmap(matrix=matrix, alpha=False)
+
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
+    tmp_path = Path(tmp.name)
+    tmp.close()
+    pix.save(str(tmp_path))
+    return tmp_path, pix.width
+
+
 def redact_columns(
     input_path: str | os.PathLike[str],
     output_path: str | os.PathLike[str],
@@ -431,10 +517,8 @@ def iter_input_pdfs(folder: Path, output_subdir_name: str) -> list[Path]:
 
 
 def output_path_for_input(input_pdf: Path, output_dir: Path) -> Path:
-    stem = input_pdf.stem
-    if stem.lower().endswith(OUTPUT_NAME_SUFFIX.lower()):
-        stem = stem[: -len(OUTPUT_NAME_SUFFIX)]
-    return output_dir / f"{stem}{OUTPUT_NAME_SUFFIX}.pdf"
+    # Keep the original filename (no added suffix after redaction).
+    return output_dir / input_pdf.name
 
 
 def batch_redact_folder(
@@ -482,6 +566,7 @@ def batch_redact_folder(
 def run_gui() -> None:
     import tkinter as tk
     from tkinter import filedialog, messagebox, scrolledtext, ttk
+    import random
 
     root = tk.Tk()
     root.title("DedactTool")
@@ -538,12 +623,182 @@ def run_gui() -> None:
     run_btn = ttk.Button(frm, text="Process all PDFs", command=run_batch)
     run_btn.grid(row=3, column=0, columnspan=2, sticky="w", pady=(0, 8))
 
-    ttk.Label(frm, text="Log:").grid(row=4, column=0, sticky="w")
-    log_box = scrolledtext.ScrolledText(frm, height=16, state="disabled", wrap="word", font=("Consolas", 9))
-    log_box.grid(row=5, column=0, columnspan=2, sticky="nsew", pady=(4, 0))
+    # --- Preview UI ---
+    preview_title = ttk.Label(frm, text="Preview (random PDF):")
+    preview_title.grid(row=4, column=0, columnspan=2, sticky="w", pady=(0, 4))
+
+    preview_controls = ttk.Frame(frm)
+    preview_controls.grid(row=5, column=0, columnspan=2, sticky="ew", pady=(0, 6))
+
+    prev_btn = ttk.Button(preview_controls, text="Prev page")
+    prev_btn.pack(side="left")
+
+    page_label = ttk.Label(preview_controls, text="Page 0/0")
+    page_label.pack(side="left", padx=10)
+
+    next_btn = ttk.Button(preview_controls, text="Next page")
+    next_btn.pack(side="right")
+
+    preview_canvas_frame = ttk.Frame(frm)
+    preview_canvas_frame.grid(row=6, column=0, columnspan=2, sticky="nsew", pady=(0, 8))
+    preview_canvas_frame.columnconfigure(0, weight=1)
+    preview_canvas_frame.rowconfigure(0, weight=1)
+
+    preview_canvas = tk.Canvas(preview_canvas_frame, bg="white", highlightthickness=0, height=700)
+    preview_vsb = ttk.Scrollbar(preview_canvas_frame, orient="vertical", command=preview_canvas.yview)
+    preview_hsb = ttk.Scrollbar(preview_canvas_frame, orient="horizontal", command=preview_canvas.xview)
+    preview_canvas.configure(yscrollcommand=preview_vsb.set, xscrollcommand=preview_hsb.set)
+
+    preview_canvas.grid(row=0, column=0, sticky="nsew")
+    preview_vsb.grid(row=0, column=1, sticky="ns")
+    preview_hsb.grid(row=1, column=0, sticky="ew")
+
+    preview_canvas.create_text(
+        10,
+        10,
+        anchor="nw",
+        fill="gray30",
+        text="Click 'Preview random PDF' to begin.\nUse Prev/Next to go page-by-page.\n(Scroll inside this area if needed.)",
+    )
+
+    preview_btn = ttk.Button(frm, text="Preview random PDF", command=lambda: None)
+    preview_btn.grid(row=7, column=0, columnspan=2, sticky="w", pady=(0, 8))
+
+    ttk.Label(frm, text="Log:").grid(row=8, column=0, sticky="w")
+    log_box = scrolledtext.ScrolledText(
+        frm, height=14, state="disabled", wrap="word", font=("Consolas", 9)
+    )
+    log_box.grid(row=9, column=0, columnspan=2, sticky="nsew", pady=(4, 0))
 
     frm.columnconfigure(0, weight=1)
-    frm.rowconfigure(5, weight=1)
+    frm.columnconfigure(1, weight=1)
+    frm.rowconfigure(6, weight=1)
+    frm.rowconfigure(9, weight=1)
+
+    preview_state: dict[str, object] = {
+        "doc": None,
+        "tmp_png": None,
+        "tk_img": None,
+        "pdf_name": None,
+        "page_idx": 0,
+        "total_pages": 0,
+    }
+
+    def _cleanup_preview_tmp() -> None:
+        tmp_path = preview_state.get("tmp_png")
+        if tmp_path and isinstance(tmp_path, Path):
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+        preview_state["tmp_png"] = None
+
+    def _close_preview_doc() -> None:
+        doc = preview_state.get("doc")
+        if doc is not None:
+            try:
+                doc.close()
+            except Exception:
+                pass
+        preview_state["doc"] = None
+
+    def _set_preview_buttons() -> None:
+        total_pages = int(preview_state.get("total_pages") or 0)
+        page_idx = int(preview_state.get("page_idx") or 0)
+        prev_btn.configure(state="normal" if total_pages > 0 and page_idx > 0 else "disabled")
+        next_btn.configure(state="normal" if total_pages > 0 and page_idx < total_pages - 1 else "disabled")
+
+    def _render_current_page() -> None:
+        doc = preview_state.get("doc")
+        if doc is None:
+            return
+        page_idx = int(preview_state.get("page_idx") or 0)
+
+        _cleanup_preview_tmp()
+        tmp_png, _ = render_page_for_preview(doc, page_idx, zoom_factor=2.0)
+        preview_state["tmp_png"] = tmp_png
+
+        # PhotoImage reads the file; keep a reference so it isn't garbage-collected.
+        img = tk.PhotoImage(file=str(tmp_png))
+        preview_canvas.delete("all")
+        preview_canvas_item = preview_canvas.create_image(0, 0, anchor="nw", image=img)
+        preview_canvas.configure(scrollregion=(0, 0, img.width(), img.height()))
+        preview_state["tk_img"] = img
+
+        total_pages = int(preview_state.get("total_pages") or 0)
+        page_label.configure(text=f"Page {page_idx + 1}/{total_pages}")
+        _set_preview_buttons()
+
+    def start_preview() -> None:
+        path = folder_var.get().strip()
+        if not path:
+            messagebox.showwarning("DedactTool", "Choose a folder first.")
+            return
+
+        try:
+            folder = Path(path).resolve()
+        except Exception:
+            messagebox.showwarning("DedactTool", "Invalid folder path.")
+            return
+
+        pdfs = iter_input_pdfs(folder, DEFAULT_OUTPUT_SUBDIR)
+        if not pdfs:
+            messagebox.showwarning("DedactTool", f"No PDF files found in {folder}")
+            return
+
+        chosen = random.choice(pdfs)
+        log(f"--- Previewing: {chosen.name} ---")
+
+        _close_preview_doc()
+        _cleanup_preview_tmp()
+        preview_state["pdf_name"] = chosen.name
+        preview_state["page_idx"] = 0
+        preview_state["total_pages"] = 0
+
+        # Build redactions in memory (no output file).
+        try:
+            doc = build_redacted_doc_for_preview(chosen, log=log)
+        except Exception as e:
+            messagebox.showerror("DedactTool", f"Preview failed: {e}")
+            return
+
+        preview_state["doc"] = doc
+        preview_state["total_pages"] = len(doc)
+        _render_current_page()
+
+    def prev_page() -> None:
+        doc = preview_state.get("doc")
+        if doc is None:
+            return
+        page_idx = int(preview_state.get("page_idx") or 0)
+        if page_idx <= 0:
+            return
+        preview_state["page_idx"] = page_idx - 1
+        _render_current_page()
+
+    def next_page() -> None:
+        doc = preview_state.get("doc")
+        if doc is None:
+            return
+        page_idx = int(preview_state.get("page_idx") or 0)
+        total_pages = int(preview_state.get("total_pages") or 0)
+        if page_idx >= total_pages - 1:
+            return
+        preview_state["page_idx"] = page_idx + 1
+        _render_current_page()
+
+    preview_btn.configure(command=start_preview)
+    prev_btn.configure(command=prev_page)
+    next_btn.configure(command=next_page)
+
+    def on_close() -> None:
+        try:
+            _cleanup_preview_tmp()
+        finally:
+            _close_preview_doc()
+        root.destroy()
+
+    root.protocol("WM_DELETE_WINDOW", on_close)
 
     root.mainloop()
 
