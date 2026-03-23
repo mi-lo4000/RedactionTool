@@ -49,7 +49,7 @@ COLUMNS_TO_REDACT = [
         "redact_text": r"^25$", 
         "use_regex": True,
         # (Venstre udvidelse, Top, Højre indsnævring, Bund)
-        "text_pad": (150, 2, -58.6, 2), 
+        "text_pad": (100, 2, -50, 2), 
     },
 
     # 2. BOKS: Til højre for 25 (100 bred, 50 afstand)
